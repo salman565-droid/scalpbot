@@ -187,24 +187,35 @@ class CryptoScalpingBot:
             logger.error(f"Telegram bot: {self.telegram_bot}, Chat ID: {self.config.TELEGRAM_CHAT_ID}")
     
     async def fetch_top_coins(self):
-        """Fetch the top 100 cryptocurrencies by market cap."""
+        """Fetch the top cryptocurrencies by 24h volume from Binance."""
         try:
-            url = "https://api.coingecko.com/api/v3/coins/markets"
-            params = {
-                'vs_currency': 'usd',
-                'order': 'market_cap_desc',
-                'per_page': self.config.TOP_COINS_COUNT,
-                'page': 1,
-                'sparkline': False
-            }
-            response = requests.get(url, params=params)
-            data = response.json()
+            # Get all USDT trading pairs from Binance
+            markets = self.exchange.fetch_markets()
+            usdt_markets = [market for market in markets if market['quote'] == 'USDT' and '/USDT' in market['symbol']]
             
-            self.top_coins = [coin['symbol'].upper() + '/USDT' for coin in data]
-            logger.info(f"Fetched top {len(self.top_coins)} coins")
+            # Get 24h ticker data for all symbols
+            tickers = self.exchange.fetch_tickers()
+            
+            # Filter and sort by volume
+            market_data = []
+            for market in usdt_markets:
+                symbol = market['symbol']
+                if symbol in tickers and 'quoteVolume' in tickers[symbol]:
+                    market_data.append({
+                        'symbol': symbol,
+                        'volume': tickers[symbol].get('quoteVolume', 0)
+                    })
+            
+            # Sort by volume and take top N
+            market_data.sort(key=lambda x: x['volume'], reverse=True)
+            top_markets = market_data[:self.config.TOP_COINS_COUNT]
+            
+            self.top_coins = [market['symbol'] for market in top_markets]
+            logger.info(f"Fetched top {len(self.top_coins)} coins by volume from Binance")
             return self.top_coins
         except Exception as e:
             logger.error(f"Failed to fetch top coins: {e}")
+            logger.exception(e)
             return []
     
     async def fetch_market_data(self):
