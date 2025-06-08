@@ -61,6 +61,7 @@ class Config:
     # Exchange API settings
     BINANCE_API_KEY = os.getenv('BINANCE_API_KEY')
     BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET')
+    HTTP_PROXY = os.getenv('HTTP_PROXY')  # For bypassing geo-restrictions
     
     # Timeframes to monitor
     TIMEFRAMES = ['5m', '15m']
@@ -123,31 +124,69 @@ class CryptoScalpingBot:
         self.last_update = datetime.datetime.now()
         
     def _initialize_exchange(self):
-        """Initialize the exchange API client."""
-        try:
-            # Check if API keys are available
-            if not self.config.BINANCE_API_KEY or not self.config.BINANCE_API_SECRET:
-                logger.warning("Binance API keys not found. Using public API only.")
-                exchange = ccxt.binance({
-                    'enableRateLimit': True,
-                    'options': {
-                        'defaultType': 'future',
-                    }
-                })
-            else:
-                exchange = ccxt.binance({
-                    'apiKey': self.config.BINANCE_API_KEY,
-                    'secret': self.config.BINANCE_API_SECRET,
-                    'enableRateLimit': True,
-                    'options': {
-                        'defaultType': 'future',
-                    }
-                })
-            logger.info("Exchange initialized successfully")
-            return exchange
-        except Exception as e:
-            logger.error(f"Failed to initialize exchange: {e}")
-            raise
+        """Initialize the exchange connection with fallbacks for geo-restrictions."""
+        exchanges_to_try = [
+            # First try Binance with proxy if configured
+            ('binance', self._get_binance_config()),
+            # Fallback to Binance.US if in the US
+            ('binanceus', self._get_binance_us_config()),
+            # Additional fallbacks
+            ('kucoin', {'enableRateLimit': True}),
+            ('gate', {'enableRateLimit': True}),
+            ('huobi', {'enableRateLimit': True}),
+            ('okx', {'enableRateLimit': True})
+        ]
+        
+        last_error = None
+        for exchange_id, config in exchanges_to_try:
+            try:
+                logger.info(f"Attempting to connect to {exchange_id}...")
+                exchange_class = getattr(ccxt, exchange_id)
+                exchange = exchange_class(config)
+                
+                # Test connection
+                exchange.load_markets()
+                logger.info(f"Successfully connected to {exchange_id}")
+                self.exchange_id = exchange_id  # Store which exchange we're using
+                return exchange
+            
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Failed to connect to {exchange_id}: {e}")
+        
+        # If we get here, all exchanges failed
+        logger.error(f"Failed to initialize any exchange. Last error: {last_error}")
+        raise last_error
+    
+    def _get_binance_config(self):
+        """Get Binance configuration with optional proxy settings."""
+        config = {'enableRateLimit': True}
+        
+        # Add API keys if available
+        if self.config.BINANCE_API_KEY and self.config.BINANCE_API_SECRET:
+            config['apiKey'] = self.config.BINANCE_API_KEY
+            config['secret'] = self.config.BINANCE_API_SECRET
+        
+        # Add proxy if configured
+        if self.config.HTTP_PROXY:
+            config['proxies'] = {
+                'http': self.config.HTTP_PROXY,
+                'https': self.config.HTTP_PROXY
+            }
+            logger.info(f"Using proxy for Binance: {self.config.HTTP_PROXY}")
+        
+        return config
+    
+    def _get_binance_us_config(self):
+        """Get Binance US configuration."""
+        config = {'enableRateLimit': True}
+        
+        # Use the same API keys for Binance US if available
+        if self.config.BINANCE_API_KEY and self.config.BINANCE_API_SECRET:
+            config['apiKey'] = self.config.BINANCE_API_KEY
+            config['secret'] = self.config.BINANCE_API_SECRET
+        
+        return config
             
     def _initialize_telegram_bot(self):
         """Initialize the Telegram bot."""
@@ -187,36 +226,61 @@ class CryptoScalpingBot:
             logger.error(f"Telegram bot: {self.telegram_bot}, Chat ID: {self.config.TELEGRAM_CHAT_ID}")
     
     async def fetch_top_coins(self):
-        """Fetch the top cryptocurrencies by 24h volume from Binance."""
+        """Fetch top coins by volume, with exchange-specific handling."""
         try:
-            # Get all USDT trading pairs from Binance
+            logger.info(f"Fetching top coins from {self.exchange_id}")
+            
+            # Get all markets
             markets = self.exchange.fetch_markets()
-            usdt_markets = [market for market in markets if market['quote'] == 'USDT' and '/USDT' in market['symbol']]
             
-            # Get 24h ticker data for all symbols
+            # Filter for USDT pairs (handling different exchange formats)
+            usdt_markets = []
+            for market in markets:
+                # Different exchanges have different market structures
+                if 'quote' in market and market['quote'] == 'USDT':
+                    usdt_markets.append(market)
+                elif '/USDT' in market.get('symbol', ''):
+                    usdt_markets.append(market)
+                elif 'USDT' in market.get('id', '') and 'symbol' in market:
+                    usdt_markets.append(market)
+            
+            # Get volume data
             tickers = self.exchange.fetch_tickers()
-            
-            # Filter and sort by volume
             market_data = []
+            
             for market in usdt_markets:
                 symbol = market['symbol']
-                if symbol in tickers and 'quoteVolume' in tickers[symbol]:
-                    market_data.append({
-                        'symbol': symbol,
-                        'volume': tickers[symbol].get('quoteVolume', 0)
-                    })
+                if symbol not in tickers:
+                    continue
+                    
+                # Different exchanges report volume differently
+                volume = 0
+                ticker = tickers[symbol]
+                
+                if 'quoteVolume' in ticker and ticker['quoteVolume']:
+                    volume = ticker['quoteVolume']
+                elif 'baseVolume' in ticker and ticker['baseVolume'] and 'last' in ticker and ticker['last']:
+                    # Estimate quote volume from base volume and price
+                    volume = ticker['baseVolume'] * ticker['last']
+                
+                if volume > 0:
+                    market_data.append({'symbol': symbol, 'volume': volume})
             
             # Sort by volume and take top N
             market_data.sort(key=lambda x: x['volume'], reverse=True)
             top_markets = market_data[:self.config.TOP_COINS_COUNT]
-            
             self.top_coins = [market['symbol'] for market in top_markets]
-            logger.info(f"Fetched top {len(self.top_coins)} coins by volume from Binance")
+            
+            logger.info(f"Found {len(self.top_coins)} top coins on {self.exchange_id}")
             return self.top_coins
+            
         except Exception as e:
-            logger.error(f"Failed to fetch top coins: {e}")
-            logger.exception(e)
-            return []
+            logger.error(f"Error fetching top coins: {e}")
+            # Return previously fetched coins if available, otherwise return a default list
+            if not self.top_coins:
+                self.top_coins = [f"BTC/USDT", f"ETH/USDT", f"BNB/USDT", f"SOL/USDT", f"XRP/USDT"]
+                logger.info("Using default coin list due to error")
+            return self.top_coins
     
     async def fetch_market_data(self):
         """Fetch market data for the top coins on multiple timeframes."""
@@ -227,37 +291,49 @@ class CryptoScalpingBot:
             
             for timeframe in self.config.TIMEFRAMES:
                 try:
-                    # Fetch OHLCV data
-                    ohlcv = self.exchange.fetch_ohlcv(
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        limit=100  # Get enough data for indicators
-                    )
+                    # Fetch OHLCV data with retry mechanism
+                    max_retries = 3
+                    retry_delay = 2  # seconds
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            # Some exchanges have different parameter names or limits
+                            if hasattr(self, 'exchange_id') and self.exchange_id in ['kucoin', 'gate']:
+                                # These exchanges might have different parameter requirements
+                                ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+                            else:
+                                # Standard approach for most exchanges
+                                ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+                            
+                            # If we got here, the request was successful
+                            break
+                        except Exception as retry_error:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Attempt {attempt+1}/{max_retries} failed for {symbol} on {timeframe}: {retry_error}")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2  # Exponential backoff
+                            else:
+                                # Last attempt failed, re-raise the exception
+                                raise
                     
                     # Convert to DataFrame
-                    df = pd.DataFrame(
-                        ohlcv,
-                        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-                    )
-                    
-                    # Convert timestamp to datetime
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     
-                    # Calculate volume change
+                    # Calculate volume change (maintaining compatibility with existing code)
                     df['volume_change'] = df['volume'] / df['volume'].shift(1)
                     
-                    # Store in market data dictionary
+                    # Store in market data dictionary with the original structure
                     self.market_data[symbol][timeframe] = df
-                    
-                    logger.info(f"Fetched market data for {symbol} on {timeframe} timeframe")
-                    
-                    # Avoid rate limiting
-                    await asyncio.sleep(0.2)
                     
                 except Exception as e:
                     logger.error(f"Failed to fetch market data for {symbol} on {timeframe}: {e}")
+            
+            if symbol in self.market_data and len(self.market_data[symbol]) > 0:
+                logger.info(f"Fetched market data for {symbol} on {len(self.market_data[symbol])} timeframes")
         
-        logger.info(f"Market data fetched for {len(self.market_data)} symbols")
+        logger.info(f"Completed market data fetch for {len(self.market_data)} symbols")
+    
         
     def calculate_indicators(self):
         """Calculate technical indicators for each symbol and timeframe."""
@@ -697,18 +773,82 @@ def health():
 
 @app.route('/status')
 def status():
-    """Get the current status of the bot."""
+    """Status endpoint to check if the bot is running."""
     global bot_instance
+    
     if bot_instance is None:
-        return jsonify({"status": "not_started", "message": "Bot has not been started yet"})
+        return jsonify({
+            "status": "error",
+            "message": "Bot not initialized"
+        })
     
     return jsonify({
-        "status": "running",
-        "monitoring_coins": len(bot_instance.top_coins),
-        "active_signals": len(bot_instance.signals),
-        "last_update": bot_instance.last_update.isoformat()
+        "status": "success",
+        "message": "Bot is running",
+        "last_update": bot_instance.last_update.strftime("%Y-%m-%d %H:%M:%S"),
+        "monitored_coins": len(bot_instance.top_coins),
+        "signals_generated": len(bot_instance.signals),
+        "exchange": getattr(bot_instance, 'exchange_id', 'unknown')
     })
 
+@app.route('/diagnostic')
+def diagnostic():
+    """Diagnostic endpoint to check exchange connectivity."""
+    global bot_instance
+    
+    if bot_instance is None:
+        return jsonify({
+            "status": "error",
+            "message": "Bot not initialized"
+        })
+    
+    # Get information about the environment
+    try:
+        import socket
+        import requests
+        import sys
+        
+        # Test basic internet connectivity
+        internet_working = False
+        try:
+            response = requests.get('https://www.google.com', timeout=5)
+            internet_working = response.status_code == 200
+        except Exception as e:
+            internet_working = False
+        
+        # Test exchange connectivity
+        exchange_working = False
+        exchange_error = None
+        exchange_id = getattr(bot_instance, 'exchange_id', 'unknown')
+        
+        try:
+            # Try to load markets as a basic connectivity test
+            bot_instance.exchange.load_markets()
+            exchange_working = True
+        except Exception as e:
+            exchange_error = str(e)
+        
+        # Get proxy information if available
+        proxy = os.getenv('HTTP_PROXY', 'Not configured')
+        
+        return jsonify({
+            "status": "success",
+            "message": "Diagnostic information",
+            "host": socket.gethostname(),
+            "python_version": sys.version,
+            "internet_connectivity": internet_working,
+            "exchange": exchange_id,
+            "exchange_connectivity": exchange_working,
+            "exchange_error": exchange_error,
+            "proxy_configured": proxy != 'Not configured',
+            "proxy": proxy if proxy != 'Not configured' else None,
+            "ccxt_version": ccxt.__version__
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error running diagnostics: {str(e)}"
+        })
 
 @app.route('/send_test_message')
 def send_test_message():
