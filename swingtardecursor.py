@@ -17,8 +17,11 @@ import hashlib
 import time
 import urllib.parse
 import os
-
+from dotenv import load_dotenv
+from contextlib import asynccontextmanager
+load_dotenv()
 last_signal = {}
+last_signal_time = {}  # (symbol+action) -> timestamp
 
 # --- CONFIG ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -27,7 +30,18 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 BINANCE_BASE = "https://api.binance.com"
 
-app = FastAPI()
+app = FastAPI(lifespan=asynccontextmanager(lifespan))
+
+# ... after config ...
+required_env = [
+    ("BINANCE_API_KEY", BINANCE_API_KEY),
+    ("BINANCE_API_SECRET", BINANCE_API_SECRET),
+    ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+    ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+]
+missing = [name for name, value in required_env if not value]
+if missing:
+    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
 # --- HTML TEMPLATE ---
 HTML = """
@@ -181,9 +195,9 @@ HTML = """
                 html += `<div class=\"mb-3 p-2 border rounded ${sig.action === 'LONG' ? 'border-success' : 'border-danger'}\">\n` +
                     `<div><b>${sig.symbol}</b> <span class=\"badge bg-${sig.action === 'LONG' ? 'success' : 'danger'}\">${sig.action}</span> ` +
                     `<span class=\"badge bg-info\">${sig.confidence}%</span> ` +
-                    `<span class=\"badge bg-secondary\">RSI 24h: ${sig.rsi_24h}</span> <span class=\"badge bg-secondary\">RSI 1h: ${sig.rsi_1h}</span></div>\n` +
+                    `<span class=\"badge bg-secondary\">RSI 1h: ${sig.rsi_1h}</span> <span class=\"badge bg-secondary\">RSI 4h: ${sig.rsi_4h}</span> <span class=\"badge bg-secondary\">RSI 1d: ${sig.rsi_1d}</span></div>\n` +
                     `<div>Entry: <b>$${sig.entry}</b> | Target: <b>$${sig.target}</b> | Stop: <b>$${sig.stop}</b></div>\n` +
-                    `<div>Change 24h: <b>${sig.price_change_24h}%</b> | 1h: <b>${sig.price_change_1h}%</b></div>\n` +
+                    `<div>Change 1h: <b>${sig.price_change_1h}%</b> | 4h: <b>${sig.price_change_4h}%</b> | 1d: <b>${sig.price_change_1d}%</b></div>\n` +
                     `<div class=\"text-muted\" style=\"font-size:0.9em;\">${sig.reason}</div>\n` +
                 `</div>`;
             });
@@ -260,7 +274,6 @@ async def fetch_historical_prices_binance(symbol, interval, limit=100):
     async with httpx.AsyncClient() as client:
         r = await client.get(url, params=params, headers=headers)
         data = r.json()
-    # Closing prices
     closes = [float(k[4]) for k in data]
     return closes
 
@@ -281,7 +294,6 @@ async def generate_signals(market):
     market = market[:40]
     for coin in market:
         symbol = coin['symbol'].upper() + 'USDT'
-        price_change_24h = coin.get('price_change_percentage_24h', 0)
         price = coin['current_price']
         volume = coin.get('total_volume', 0)
         high = coin.get('high_24h', price)
@@ -290,29 +302,46 @@ async def generate_signals(market):
         median_vol = sorted([c['total_volume'] for c in market])[len(market)//2]
         volume_spike = volume / median_vol if median_vol else 1
         trend = 1 if price > (high + low) / 2 else -1
-        # --- Multi-timeframe ---
         try:
-            prices_1h = await fetch_historical_prices_binance(symbol, '1m', limit=61)  # last 1h (1m candles)
-            prices_24h = await fetch_historical_prices_binance(symbol, '1h', limit=25)  # last 25h (1h candles)
-            rsi_24h = calculate_rsi(prices_24h, period=14)
+            # 1h timeframe
+            prices_1h = await fetch_historical_prices_binance(symbol, '1m', limit=61)
             rsi_1h = calculate_rsi(prices_1h, period=14)
             price_1h_ago = prices_1h[0] if len(prices_1h) > 0 else price
             price_change_1h = ((price - price_1h_ago) / price_1h_ago) * 100 if price_1h_ago else 0
+            # 4h timeframe
+            prices_4h = await fetch_historical_prices_binance(symbol, '15m', limit=17)  # 4h = 16*15m
+            rsi_4h = calculate_rsi(prices_4h, period=14)
+            price_4h_ago = prices_4h[0] if len(prices_4h) > 0 else price
+            price_change_4h = ((price - price_4h_ago) / price_4h_ago) * 100 if price_4h_ago else 0
+            # 1d timeframe
+            prices_1d = await fetch_historical_prices_binance(symbol, '1h', limit=25)
+            rsi_1d = calculate_rsi(prices_1d, period=14)
+            price_1d_ago = prices_1d[0] if len(prices_1d) > 0 else price
+            price_change_1d = ((price - price_1d_ago) / price_1d_ago) * 100 if price_1d_ago else 0
         except Exception:
-            rsi_24h = 50
-            rsi_1h = 50
-            price_change_1h = 0
+            rsi_1h = rsi_4h = rsi_1d = 50
+            price_change_1h = price_change_4h = price_change_1d = 0
+        # --- Multi-timeframe agreement ---
+        bullish = sum([
+            price_change_1h > 0.5 and rsi_1h > 50,
+            price_change_4h > 0.5 and rsi_4h > 50,
+            price_change_1d > 1 and rsi_1d > 50
+        ])
+        bearish = sum([
+            price_change_1h < -0.5 and rsi_1h < 50,
+            price_change_4h < -0.5 and rsi_4h < 50,
+            price_change_1d < -1 and rsi_1d < 50
+        ])
         confidence = 0
         reason = []
         action = None
-        # Multi-timeframe alignment
-        if price_change_24h > 2 and price_change_1h > 0.5 and rsi_24h > 50 and rsi_1h > 50:
+        if bullish >= 2:
             confidence += 30
-            reason.append(f"Bullish on both 24h ({price_change_24h:.2f}%) and 1h ({price_change_1h:.2f}%)")
+            reason.append(f"Bullish on {bullish} timeframes (1h:{price_change_1h:.2f}%,4h:{price_change_4h:.2f}%,1d:{price_change_1d:.2f}%)")
             action = "LONG"
-        elif price_change_24h < -2 and price_change_1h < -0.5 and rsi_24h < 50 and rsi_1h < 50:
+        elif bearish >= 2:
             confidence += 30
-            reason.append(f"Bearish on both 24h ({price_change_24h:.2f}%) and 1h ({price_change_1h:.2f}%)")
+            reason.append(f"Bearish on {bearish} timeframes (1h:{price_change_1h:.2f}%,4h:{price_change_4h:.2f}%,1d:{price_change_1d:.2f}%)")
             action = "SHORT"
         if volume_spike > 1.5:
             confidence += 20
@@ -326,28 +355,36 @@ async def generate_signals(market):
         elif trend == -1 and action == "SHORT":
             confidence += 10
             reason.append("Downtrend confirmed")
-        if action == "LONG" and 40 < rsi_24h < 70 and 40 < rsi_1h < 70:
+        if action == "LONG" and all(x > 40 and x < 70 for x in [rsi_1h, rsi_4h, rsi_1d]):
             confidence += 15
-            reason.append(f"RSI favorable (24h: {rsi_24h:.1f}, 1h: {rsi_1h:.1f})")
-        elif action == "SHORT" and 30 < rsi_24h < 60 and 30 < rsi_1h < 60:
+            reason.append(f"RSI favorable (1h:{rsi_1h:.1f},4h:{rsi_4h:.1f},1d:{rsi_1d:.1f})")
+        elif action == "SHORT" and all(x > 30 and x < 60 for x in [rsi_1h, rsi_4h, rsi_1d]):
             confidence += 15
-            reason.append(f"RSI favorable (24h: {rsi_24h:.1f}, 1h: {rsi_1h:.1f})")
+            reason.append(f"RSI favorable (1h:{rsi_1h:.1f},4h:{rsi_4h:.1f},1d:{rsi_1d:.1f})")
         confidence = min(confidence, 99)
+        # --- Signal suppression: only allow same coin+action after 1 hour ---
+        key = coin['symbol'].upper() + action if action else None
+        now = time.time()
         if action and confidence >= 70:
-            sig = {
-                "symbol": coin['symbol'].upper() + "/USDT",
-                "action": action,
-                "entry": price,
-                "target": round(price * (1.04 if action == "LONG" else 0.96), 2),
-                "stop": round(price * (0.98 if action == "LONG" else 1.02), 2),
-                "confidence": confidence,
-                "rsi_24h": round(rsi_24h, 2),
-                "rsi_1h": round(rsi_1h, 2),
-                "price_change_24h": round(price_change_24h, 2),
-                "price_change_1h": round(price_change_1h, 2),
-                "reason": "; ".join(reason)
-            }
-            signals.append(sig)
+            last_time = last_signal_time.get(key, 0)
+            if now - last_time >= 3600:  # 1 hour
+                sig = {
+                    "symbol": coin['symbol'].upper() + "/USDT",
+                    "action": action,
+                    "entry": price,
+                    "target": round(price * (1.04 if action == "LONG" else 0.96), 2),
+                    "stop": round(price * (0.98 if action == "LONG" else 1.02), 2),
+                    "confidence": confidence,
+                    "rsi_1h": round(rsi_1h, 2),
+                    "rsi_4h": round(rsi_4h, 2),
+                    "rsi_1d": round(rsi_1d, 2),
+                    "price_change_1h": round(price_change_1h, 2),
+                    "price_change_4h": round(price_change_4h, 2),
+                    "price_change_1d": round(price_change_1d, 2),
+                    "reason": "; ".join(reason)
+                }
+                signals.append(sig)
+                last_signal_time[key] = now
     return signals
 
 # --- TELEGRAM ALERTS ---
@@ -358,8 +395,8 @@ async def send_telegram_alert(signal):
         f"Target: ${signal['target']}\n"
         f"Stop: ${signal['stop']}\n"
         f"Confidence: {signal['confidence']}%\n"
-        f"RSI 24h: {signal['rsi_24h']} | RSI 1h: {signal['rsi_1h']}\n"
-        f"Change 24h: {signal['price_change_24h']}% | 1h: {signal['price_change_1h']}%\n"
+        f"RSI 1h: {signal['rsi_1h']} | 4h: {signal['rsi_4h']} | 1d: {signal['rsi_1d']}\n"
+        f"Change 1h: {signal['price_change_1h']}% | 4h: {signal['price_change_4h']}% | 1d: {signal['price_change_1d']}%\n"
         f"Reason: {signal['reason']}"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -415,11 +452,13 @@ async def startup_signal_check():
     else:
         print(f"[INFO] {len(signals)} signals detected on startup.")
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+def lifespan(app: FastAPI):
     asyncio.create_task(periodic_signal_check())
     asyncio.create_task(send_startup_message())
     asyncio.create_task(startup_signal_check())
+    yield
+    # (Optional) Add shutdown code here if needed
 
 # --- If no signals are generated, send a message to Telegram on startup ---
 # (This is only on startup, not every interval)
