@@ -30,7 +30,14 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 BINANCE_BASE = "https://api.binance.com"
 
-app = FastAPI(lifespan=asynccontextmanager(lifespan))
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(periodic_signal_check())
+    asyncio.create_task(send_startup_message())
+    asyncio.create_task(startup_signal_check())
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # ... after config ...
 required_env = [
@@ -451,14 +458,6 @@ async def startup_signal_check():
         await send_no_signals_message()
     else:
         print(f"[INFO] {len(signals)} signals detected on startup.")
-
-@asynccontextmanager
-def lifespan(app: FastAPI):
-    asyncio.create_task(periodic_signal_check())
-    asyncio.create_task(send_startup_message())
-    asyncio.create_task(startup_signal_check())
-    yield
-    # (Optional) Add shutdown code here if needed
 
 # --- If no signals are generated, send a message to Telegram on startup ---
 # (This is only on startup, not every interval)
